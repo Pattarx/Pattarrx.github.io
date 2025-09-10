@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Golf Cart Tracker</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+  <style>
+    html, body { height: 100%; margin: 0; }
+    #map { height: 100%; width: 100%; }
+    .controls {
+      position: absolute; z-index: 1000; top: 10px; left: 10px;
+      background: rgba(255,255,255,0.9); padding: 8px 10px; border-radius: 8px;
+      box-shadow: 0 2px 8px rgba(0,0,0,.15); font-family: system-ui, sans-serif; font-size: 14px;
+    }
+    .controls label { cursor: pointer; user-select: none; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="controls">
+    <label><input id="followToggle" type="checkbox" checked> Follow cart</label>
+  </div>
+
+  <!-- Leaflet JS -->
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+
+  <!-- Firebase (ESM) -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+    import {
+      getDatabase, ref, onValue, query, limitToLast, onChildAdded
+    } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
+
+    // Firebase Config
+    const firebaseConfig = {
+      apiKey: "AIzaSyDJoZLiAl1NMIhY9BRp8-Hb3e1juIrGdfw",
+      authDomain: "golf-cart-tracker-465d1.firebaseapp.com",
+      databaseURL: "https://golf-cart-tracker-465d1-default-rtdb.firebaseio.com",
+      projectId: "golf-cart-tracker-465d1",
+      storageBucket: "golf-cart-tracker-465d1.firebasestorage.app",
+      messagingSenderId: "185568329385",
+      appId: "1:185568329385:web:eaa922c5b3d9c20bd373b8",
+      measurementId: "G-M36W5R0474"
+    };
+
+    // Init Firebase
+    const app = initializeApp(firebaseConfig);
+    const db  = getDatabase(app);
+
+    // Leaflet Map
+    const map = L.map('map', { zoomControl: true }).setView([13.7563, 100.5018], 16);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '© OpenStreetMap'
+    }).addTo(map);
+
+    // Custom icon (optional)
+    const cartIcon = L.icon({
+      iconUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png',
+      iconSize: [25, 41],
+      iconAnchor: [12, 41],
+      popupAnchor: [1, -34],
+      shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
+      shadowSize: [41, 41]
+    });
+
+    let marker = L.marker([13.7563, 100.5018], { icon: cartIcon }).addTo(map);
+    marker.bindPopup("Waiting for GPS...").openPopup();
+
+    // Breadcrumb polyline (history)
+    const trailCoords = [];
+    const trail = L.polyline(trailCoords, { weight: 4, opacity: 0.9 }).addTo(map);
+
+    // UI follow toggle
+    const followToggle = document.getElementById('followToggle');
+
+    let hasCentered = false;
+
+    function updateUI(lat, lon, vel, sats, timestamp) {
+      const lines = [
+        `Lat: ${lat.toFixed(6)}`,
+        `Lon: ${lon.toFixed(6)}`,
+        `Speed: ${vel?.toFixed ? vel.toFixed(1) : Number(vel || 0).toFixed(1)} km/h`,
+        sats != null ? `Sats: ${sats}` : null,
+        timestamp ? `Time: ${timestamp}` : null
+      ].filter(Boolean);
+
+      marker.setPopupContent(lines.join('<br>'));
+    }
+
+    function moveMarker(lat, lon, shouldCenter) {
+      marker.setLatLng([lat, lon]);
+      if (shouldCenter) map.setView([lat, lon]);
+    }
+
+    // Data Sources (for both old and new database structure)
+
+    // Latest position (new shape)
+    const latestNewRef = ref(db, 'cart/latest');
+    const latestOldRef = ref(db, 'cart');
+
+    let usingNewShape = true;
+
+    onValue(latestNewRef, (snap) => {
+      const d = snap.val();
+      if (!d) { usingNewShape = false; return; }
+
+      const { lat, lon, vel, sats, timestamp } = d;
+      if (lat != null && lon != null) {
+        const centerNow = followToggle.checked && (!hasCentered);
+        moveMarker(lat, lon, centerNow);
+        if (!hasCentered && centerNow) hasCentered = true;
+        updateUI(lat, lon, vel, sats, timestamp);
+      }
+    });
+
+    // Fallback to old shape
+    onValue(latestOldRef, (snap) => {
+      if (usingNewShape) return;
+      const d = snap.val();
+      if (d && d.lat != null && d.lon != null) {
+        const lat = d.lat, lon = d.lon;
+        const vel = d.vel ?? 0;
+        const timestamp = d.timestamp ?? null;
+        const sats = d.sats ?? null;
+
+        const centerNow = followToggle.checked && (!hasCentered);
+        moveMarker(lat, lon, centerNow);
+        if (!hasCentered && centerNow) hasCentered = true;
+        updateUI(lat, lon, vel, sats, timestamp);
+      }
+    });
+
+    // History trail (stream last N points)
+    const HISTORY_POINTS = 300;
+    const historyRef = query(ref(db, 'cart/history'), limitToLast(HISTORY_POINTS));
+
+    onChildAdded(historyRef, (snap) => {
+      const d = snap.val();
+      if (!d || d.lat == null || d.lon == null) return;
+      trailCoords.push([d.lat, d.lon]);
+
+      // keep at most HISTORY_POINTS
+      if (trailCoords.length > HISTORY_POINTS) trailCoords.shift();
+      trail.setLatLngs(trailCoords);
+
+      if (!hasCentered && trailCoords.length >= 2 && !followToggle.checked) {
+        map.fitBounds(trail.getBounds(), { padding: [30, 30] });
+        hasCentered = true;
+      }
+    });
+
+    marker.on('click', () => {
+      const pos = marker.getLatLng();
+      map.setView(pos);
+    });
+
+    followToggle.addEventListener('change', () => {
+      if (followToggle.checked) {
+        const pos = marker.getLatLng();
+        if (pos) map.setView(pos);
+      }
+    });
+  </script>
+</body>
+</html>
